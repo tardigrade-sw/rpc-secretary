@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"maps"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -17,6 +17,7 @@ import (
 
 type DocsServer struct {
 	ProtoPath      string
+	IncludePaths   []string // Additional include paths for protoc
 	ReflectionAddr string
 }
 
@@ -25,6 +26,11 @@ func NewDocsServer(protoPath, reflectionAddr string) *DocsServer {
 		ProtoPath:      protoPath,
 		ReflectionAddr: reflectionAddr,
 	}
+}
+
+// AddIncludePath adds an additional search directory for .proto files.
+func (s *DocsServer) AddIncludePath(path string) {
+	s.IncludePaths = append(s.IncludePaths, path)
 }
 
 // Serve starts an HTTP server that provides the gRPC API documentation as JSON.
@@ -40,27 +46,19 @@ func (s *DocsServer) handleDocs(w http.ResponseWriter, r *http.Request) {
 		Enums:    make(map[string]rpcTypes.Enum),
 	}
 
-	// 1. Try local files if path is provided
 	if s.ProtoPath != "" {
 		localDoc, err := s.parseLocal(s.ProtoPath)
 		if err == nil {
-			doc.Services = append(doc.Services, localDoc.Services...)
-			for k, v := range localDoc.Messages {
-				doc.Messages[k] = v
-			}
-			for k, v := range localDoc.Enums {
-				doc.Enums[k] = v
-			}
+			s.mergeDoc(&doc, localDoc)
+		} else {
+			log.Printf("%v", err)
 		}
 	}
 
-	// 2. Try reflection if address is provided
 	if s.ReflectionAddr != "" {
 		reflectDoc, err := s.parseReflection(s.ReflectionAddr)
 		if err == nil {
-			doc.Services = append(doc.Services, reflectDoc.Services...)
-			maps.Copy(doc.Messages, reflectDoc.Messages)
-			maps.Copy(doc.Enums, reflectDoc.Enums)
+			s.mergeDoc(&doc, reflectDoc)
 		}
 	}
 
@@ -100,6 +98,7 @@ func (s *DocsServer) parseLocal(protoPath string) (rpcTypes.Documentation, error
 		for _, file := range files {
 			block, err := s.parseFile2Service(file)
 			if err != nil {
+				log.Printf("Error parsing file %s: %v, or dir empty", file, err)
 				continue
 			}
 			s.mergeDoc(&doc, block)
@@ -111,12 +110,30 @@ func (s *DocsServer) parseLocal(protoPath string) (rpcTypes.Documentation, error
 		protoFiles, err := tools.GetFilesByType(protoPath, ".proto")
 		if err == nil && len(protoFiles) > 0 {
 			tempBundle := filepath.Join(os.TempDir(), "rpc-secretary-bundle.pb")
-			if err := tools.CompileProtos(protoPath, protoFiles, tempBundle); err == nil {
+
+			// Start with the proto directory and any user-specified paths
+			includes := append([]string{protoPath}, s.IncludePaths...)
+
+			// Add common system include paths if they exist
+			commonPaths := []string{"/usr/include", "/usr/local/include"}
+			for _, p := range commonPaths {
+				if info, err := os.Stat(p); err == nil && info.IsDir() {
+					includes = append(includes, p)
+				}
+			}
+
+			if err := tools.CompileProtos(includes, protoFiles, tempBundle); err == nil {
 				block, err := s.parseFile2Service(tempBundle)
 				if err == nil {
 					s.mergeDoc(&doc, block)
+				} else {
+					log.Printf("Error parsing .proto file %v", err)
 				}
+			} else {
+				log.Printf("Error parsing .proto file %v", err)
 			}
+		} else {
+			log.Printf("Error parsing proto dir: (%v), or dir empty", err)
 		}
 	}
 
@@ -124,9 +141,47 @@ func (s *DocsServer) parseLocal(protoPath string) (rpcTypes.Documentation, error
 }
 
 func (s *DocsServer) mergeDoc(base *rpcTypes.Documentation, extra rpcTypes.Documentation) {
-	base.Services = append(base.Services, extra.Services...)
-	maps.Copy(base.Messages, extra.Messages)
-	maps.Copy(base.Enums, extra.Enums)
+	serviceIndices := make(map[string]int)
+	for i, svc := range base.Services {
+		serviceIndices[svc.Name] = i
+	}
+
+	for _, extraSvc := range extra.Services {
+		if idx, exists := serviceIndices[extraSvc.Name]; exists {
+			if base.Services[idx].Description == "" && extraSvc.Description != "" {
+				base.Services[idx].Description = extraSvc.Description
+			}
+			for j := range base.Services[idx].Methods {
+				if j < len(extraSvc.Methods) {
+					if base.Services[idx].Methods[j].Description == "" && extraSvc.Methods[j].Description != "" {
+						base.Services[idx].Methods[j].Description = extraSvc.Methods[j].Description
+					}
+				}
+			}
+		} else {
+			base.Services = append(base.Services, extraSvc)
+		}
+	}
+
+	for k, v := range extra.Messages {
+		if existing, ok := base.Messages[k]; ok {
+			if existing.Description == "" && v.Description != "" {
+				base.Messages[k] = v
+			}
+		} else {
+			base.Messages[k] = v
+		}
+	}
+
+	for k, v := range extra.Enums {
+		if existing, ok := base.Enums[k]; ok {
+			if existing.Description == "" && v.Description != "" {
+				base.Enums[k] = v
+			}
+		} else {
+			base.Enums[k] = v
+		}
+	}
 }
 
 func (s *DocsServer) parseFile2Service(filePath string) (rpcTypes.Documentation, error) {

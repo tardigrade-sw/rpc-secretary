@@ -29,7 +29,6 @@ func GetFilesByType(root, ext string) ([]string, error) {
 			return err
 		}
 
-		// Only add to list if it's not a directory and has the right extension
 		if !d.IsDir() && filepath.Ext(path) == ext {
 			files = append(files, path)
 		}
